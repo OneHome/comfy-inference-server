@@ -1,0 +1,5 @@
+Pillow>=9.5.0
+websockets==11.0.3
+pymongo
+cryptography
+lark==1.1.5
