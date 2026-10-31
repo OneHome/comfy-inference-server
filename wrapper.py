@@ -11,6 +11,7 @@ import shutil
 import PIL.Image
 import PIL.ImageOps
 import PIL.ImageFilter
+import numpy as np
 
 import torch
 import torchvision.transforms as transforms
@@ -36,6 +37,77 @@ STATIC = ["model_path", "callback", "device_names", "temporary", "device", "_loa
 # Virtual entry shown in the ControlNet list: it is not a model file but an image reference for Anima/Cosmos
 # models (needed by the "Anima Edit" LoRAs). Same idea as Mirumo0u0/ComfyUI-Cosmos-Reference (Apache-2.0).
 REFERENCE_NAME = "Cosmos Reference"
+
+# ---- control image preprocessors: they need no extra models (see preprocess_image) ----
+PREPROCESSORS = ["None", "Invert", "Grayscale", "Canny", "Sketch"]
+
+def _canny_numpy(rgb, low, high):
+    """Fallback Canny (OpenCV is used when installed): Sobel gradients, non-maximum suppression, hysteresis."""
+    from scipy import ndimage
+    gray = ndimage.gaussian_filter(rgb.astype(np.float32).mean(axis=2), 1.0)
+    gx = ndimage.sobel(gray, axis=1)
+    gy = ndimage.sobel(gray, axis=0)
+    mag = np.abs(gx) + np.abs(gy)  # same units as cv2.Canny's default L1 norm
+
+    angle = np.rad2deg(np.arctan2(gy, gx)) % 180.0
+    sector = np.zeros(angle.shape, np.int8)
+    sector[(angle >= 22.5) & (angle < 67.5)] = 1
+    sector[(angle >= 67.5) & (angle < 112.5)] = 2
+    sector[(angle >= 112.5) & (angle < 157.5)] = 3
+
+    padded = np.pad(mag, 1)
+    def shifted(dy, dx):
+        h, w = mag.shape
+        return padded[1+dy:1+dy+h, 1+dx:1+dx+w]
+    neighbours = {0: ((0, -1), (0, 1)), 1: ((-1, -1), (1, 1)), 2: ((-1, 0), (1, 0)), 3: ((-1, 1), (1, -1))}
+    keep = np.zeros(mag.shape, bool)
+    for k, ((ay, ax), (by, bx)) in neighbours.items():
+        keep |= (sector == k) & (mag >= shifted(ay, ax)) & (mag >= shifted(by, bx))
+
+    strong = keep & (mag >= high)
+    weak = keep & (mag >= low)
+    labels, _ = ndimage.label(weak, structure=np.ones((3, 3)))
+    wanted = np.unique(labels[strong])
+    return (np.isin(labels, wanted[wanted > 0]) * 255).astype(np.uint8)
+
+def _canny(img, low=0.4, high=0.8):
+    rgb = np.asarray(img.convert("RGB"))
+    low, high = int(float(low) * 255), int(float(high) * 255)
+    try:
+        import cv2
+        edges = cv2.Canny(rgb, low, high)
+    except ImportError:
+        edges = _canny_numpy(rgb, low, high)
+    return PIL.Image.fromarray(edges).convert("RGB")
+
+def _sketch(img, width=0.25, cleanup=0.5):
+    """Pencil-sketch style line art (dark lines on white) from any picture: color dodge of the
+    gray image against its blurred inverse. width = line thickness, cleanup = whitens faint areas."""
+    gray = img.convert("L")
+    sigma = 1.0 + 7.0 * float(width)
+    blurred_inverse = PIL.ImageOps.invert(gray).filter(PIL.ImageFilter.GaussianBlur(sigma))
+    a = np.asarray(gray, np.float32)
+    b = np.asarray(blurred_inverse, np.float32)
+    out = np.minimum(a * 255.0 / np.maximum(255.0 - b, 1.0), 255.0) / 255.0
+    t = 0.8 * float(cleanup)
+    out = np.clip((out - t) / (1.0 - t), 0.0, 1.0)
+    return PIL.Image.fromarray((out * 255.0 + 0.5).astype(np.uint8)).convert("RGB")
+
+def preprocess_image(img, name, args=None):
+    """Turn a picture into a control image. `args` are the slider values of the client, in order."""
+    args = list(args or [])
+    if not name or name == "None":
+        return img
+    img = img.convert("RGB")
+    if name == "Invert":
+        return PIL.ImageOps.invert(img)
+    if name == "Grayscale":
+        return img.convert("L").convert("RGB")
+    if name == "Canny":
+        return _canny(img, *args[:2])
+    if name == "Sketch":
+        return _sketch(img, *args[:2])
+    raise RuntimeError(f"Unknown preprocessor '{name}'")
 
 prompt_grammar = lark.Lark(r"""
 !start: (prompt | /[\[\]:]/+)*
@@ -206,6 +278,8 @@ class GenerationParameters():
                     value = [self._bytes_to_mask(v) if type(v) in (bytes, bytearray) else v for v in value]
                 elif type(value) in (bytes, bytearray):
                     value = self._bytes_to_mask(value)
+            if key == "cn_image" and value:
+                value = [self._bytes_to_image(v) if type(v) in (bytes, bytearray) else v for v in value]
             if key == "area" and value:
                 # per batch item, a list with one painted layer per subprompt (alpha = coverage)
                 first = value[0] if type(value[0]) == list else value
@@ -711,6 +785,7 @@ class GenerationParameters():
             if mask is not None:
                 mask = self._crop_like(mask, reference_size, extent)
             image = self._upscale([image], width, height)
+            image = [preprocess_image(image[0], unit.get("preprocessor"), unit.get("args"))]
 
             if hasattr(controlnet, "model_patches_to"):
                 # model patch (Anima LLLite): needs the IMAGE as (1,H,W,3) and an optional (1,H,W) mask
@@ -1389,6 +1464,23 @@ class GenerationParameters():
                     shutil.move(old_file, new_file)
 
             self.options()
+
+    @torch.inference_mode()
+    def annotate(self):
+        """Preview of a preprocessor: returns the processed picture to the client."""
+        self.set_status("Annotating")
+        images = self.cn_image or []
+        if not images:
+            raise RuntimeError("There is no image to preprocess.")
+        names = self.cn_annotator or [None]
+        args = self.cn_args or [[]]
+        result = preprocess_image(images[0], names[0], args[0])
+
+        bytesio = io.BytesIO()
+        result.save(bytesio, format="PNG")
+        if self.callback:
+            if not self.callback({"type": "annotate", "data": {"images": [bytesio.getvalue()], "type": "PNG"}}):
+                raise AbortError("Aborted")
 
     def options(self):
         data = {}

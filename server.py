@@ -231,6 +231,10 @@ class Inference(threading.Thread):
                     #print({k:v for k,v in request["data"].items() if k not in {"image", "mask"}})
                     self.wrapper.set(**request["data"])
                     self.wrapper.upscale()
+                elif request["type"] == "annotate":
+                    self.wrapper.reset()
+                    self.wrapper.set(**request["data"])
+                    self.wrapper.annotate()
                 elif request["type"] == "options":
                     self.wrapper.reset()
                     self.wrapper.options()
