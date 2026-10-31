@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import urllib.request
 import gc
 import random
 import time
@@ -32,7 +33,7 @@ import latent_preview
 
 latent_preview.set_preview_method("latent2rgb")
 
-STATIC = ["model_path", "callback", "device_names", "temporary", "device", "_loaded"]
+STATIC = ["model_path", "callback", "device_names", "temporary", "device", "_loaded", "_annotators"]
 
 # Virtual entry shown in the ControlNet list: it is not a model file but an image reference for Anima/Cosmos
 # models (needed by the "Anima Edit" LoRAs). Same idea as Mirumo0u0/ComfyUI-Cosmos-Reference (Apache-2.0).
@@ -40,6 +41,10 @@ REFERENCE_NAME = "Cosmos Reference"
 
 # ---- control image preprocessors: they need no extra models (see preprocess_image) ----
 PREPROCESSORS = ["None", "Invert", "Grayscale", "Canny", "Sketch"]
+# preprocessors that run a neural network: see the "annotator" folder (weights are downloaded on first use)
+MODEL_PREPROCESSORS = ["Anyline", "Lineart", "Lineart Anime", "Softedge", "Scribble", "M-LSD", "Depth", "Pose"]
+ANNOTATOR_SIZE_STEP = 64  # these networks want sizes that are a multiple of 64
+ANNOTATOR_PREVIEW_MAX = 1024  # longest side of the picture used for a preview
 
 def _canny_numpy(rgb, low, high):
     """Fallback Canny (OpenCV is used when installed): Sobel gradients, non-maximum suppression, hysteresis."""
@@ -142,6 +147,7 @@ class GenerationParameters():
         self.temporary = {}
         self.device = None
         self._loaded = {}
+        self._annotators = {}
 
         self.device_names = []
         for i in range(torch.cuda.device_count()):
@@ -785,7 +791,7 @@ class GenerationParameters():
             if mask is not None:
                 mask = self._crop_like(mask, reference_size, extent)
             image = self._upscale([image], width, height)
-            image = [preprocess_image(image[0], unit.get("preprocessor"), unit.get("args"))]
+            image = [self._preprocess(image[0], unit.get("preprocessor"), unit.get("args"))]
 
             if hasattr(controlnet, "model_patches_to"):
                 # model patch (Anima LLLite): needs the IMAGE as (1,H,W,3) and an optional (1,H,W) mask
@@ -1465,6 +1471,81 @@ class GenerationParameters():
 
             self.options()
 
+    def _download_annotator_file(self, url, file):
+        os.makedirs(os.path.dirname(file), exist_ok=True)
+        label = os.path.basename(file)
+        tmp = file + ".tmp"
+        self.set_status(f"Downloading {label}")
+        request = urllib.request.Request(url, headers={"User-Agent": "qcomfy-inference-server"})
+        with urllib.request.urlopen(request, timeout=60) as response, open(tmp, "wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done, last = 0, -1
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if total and int(done * 100 / total) // 5 != last:
+                    last = int(done * 100 / total) // 5
+                    self.set_status(f"Downloading {label} {last * 5}%")
+        os.replace(tmp, file)
+
+    def _annotator(self, name):
+        """The (cached) network of a model-based preprocessor; its weights are downloaded the first time."""
+        model = self._annotators.get(name)
+        if model is None:
+            try:
+                import annotator
+                cls = annotator.get_annotator_class(name)
+                folder = os.path.join(folder_paths.models_dir, "annotators")
+                self.set_status(f"Loading {name}")
+                model = cls(folder, self._download_annotator_file)
+            except ModuleNotFoundError as e:
+                if e.name == "annotator":
+                    raise RuntimeError("The 'annotator' folder is missing: it must sit next to wrapper.py.")
+                raise RuntimeError(f"The '{name}' preprocessor needs the Python package '{e.name}' (pip install {e.name}).")
+            self._annotators[name] = model
+        return model
+
+    @torch.inference_mode()
+    def _run_annotator(self, name, img, args):
+        model = self._annotator(name)
+        device = comfy.model_management.get_torch_device()
+
+        # the networks want a size that is a multiple of 64: work at that size and come back to the original one
+        w, h = img.size
+        step = ANNOTATOR_SIZE_STEP
+        size = (max(step, round(w / step) * step), max(step, round(h / step) * step))
+        source = img.convert("RGB")
+        if size != (w, h):
+            source = source.resize(size, PIL.Image.Resampling.LANCZOS)
+
+        self.set_status(f"Preprocessing ({name})")
+        model.to(device, torch.float32)
+        try:
+            out = model(np.asarray(source), *args)
+        finally:
+            model.to(torch.device("cpu"), torch.float32)
+            comfy.model_management.soft_empty_cache()
+
+        if isinstance(out, tuple):  # Pose also returns the pose data
+            out = out[0]
+        out = np.asarray(out)
+        if out.ndim == 2:
+            out = np.stack([out] * 3, axis=-1)
+        elif out.shape[-1] == 1:
+            out = np.repeat(out, 3, axis=-1)
+        result = PIL.Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).convert("RGB")
+        if result.size != (w, h):
+            result = result.resize((w, h), PIL.Image.Resampling.LANCZOS)
+        return result
+
+    def _preprocess(self, img, name, args=None):
+        if name in MODEL_PREPROCESSORS:
+            return self._run_annotator(name, img, list(args or []))
+        return preprocess_image(img, name, args)
+
     @torch.inference_mode()
     def annotate(self):
         """Preview of a preprocessor: returns the processed picture to the client."""
@@ -1474,7 +1555,11 @@ class GenerationParameters():
             raise RuntimeError("There is no image to preprocess.")
         names = self.cn_annotator or [None]
         args = self.cn_args or [[]]
-        result = preprocess_image(images[0], names[0], args[0])
+        image = images[0]
+        if max(image.size) > ANNOTATOR_PREVIEW_MAX:  # a preview does not need the full resolution
+            k = ANNOTATOR_PREVIEW_MAX / max(image.size)
+            image = image.resize((max(1, round(image.width * k)), max(1, round(image.height * k))), PIL.Image.Resampling.LANCZOS)
+        result = self._preprocess(image, names[0], args[0])
 
         bytesio = io.BytesIO()
         result.save(bytesio, format="PNG")
