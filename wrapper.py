@@ -39,6 +39,30 @@ STATIC = ["model_path", "callback", "device_names", "temporary", "device", "_loa
 # models (needed by the "Anima Edit" LoRAs). Same idea as Mirumo0u0/ComfyUI-Cosmos-Reference (Apache-2.0).
 REFERENCE_NAME = "Cosmos Reference"
 
+# ---- Anima control-LoRAs (e.g. Claquasse/Anima-Control-Pose): one file holding a LoRA ("lora.*" keys) plus a
+# control embedder ("control_embedder.*" keys). Logic of its AnimaControlApply node, re-implemented here.
+class AnimaControlLora:
+    def __init__(self, embedder_state, lora_state, lora_metadata):
+        self.embedder_state = embedder_state
+        self.lora_state = lora_state
+        self.lora_metadata = lora_metadata
+
+class AnimaControlEmbedder(torch.nn.Module):
+    """Patch projection of the control latent, with the same patching as the base patch embedding of the DiT:
+    (B, C, T, H, W) -> (B, T, H/2, W/2, model_channels)."""
+    def __init__(self, in_channels=16, model_channels=2048, spatial_patch_size=2, temporal_patch_size=1):
+        super().__init__()
+        self.m = spatial_patch_size
+        self.r = temporal_patch_size
+        self.proj = torch.nn.Linear(in_channels * self.m * self.m * self.r, model_channels)
+
+    def forward(self, x):
+        b, c, t, h, w = x.shape
+        r, m = self.r, self.m
+        x = x.reshape(b, c, t // r, r, h // m, m, w // m, m)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
+        return self.proj(x.reshape(b, t // r, h // m, w // m, c * r * m * m))
+
 # ---- control image preprocessors: they need no extra models (see preprocess_image) ----
 PREPROCESSORS = ["None", "Invert", "Grayscale", "Canny", "Sketch"]
 # preprocessors that run a neural network: see the "annotator" folder (weights are downloaded on first use)
@@ -618,7 +642,10 @@ class GenerationParameters():
             return cached[1]
         self.set_status("Loading ControlNet")
         keys = self._safetensors_keys(path)
-        if keys is not None and "lllite_conditioning1.conv1.weight" in keys:
+        if keys is not None and any("control_embedder." in k for k in keys):
+            # Anima control-LoRA (a LoRA plus a control embedder in the same file)
+            controlnet = self._load_anima_control_lora(path)
+        elif keys is not None and "lllite_conditioning1.conv1.weight" in keys:
             # Anima LLLite: a "model patch", not a classic ControlNet
             controlnet = self._load_model_patch(name, keys)
         else:
@@ -628,6 +655,52 @@ class GenerationParameters():
         # stored as (path, obj) so _evict_other_models can iterate it like the others
         self._loaded[key] = (path, controlnet)
         return controlnet
+
+    def _load_anima_control_lora(self, path):
+        sd, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+        embedder = {k.split("control_embedder.", 1)[1]: v for k, v in sd.items() if "control_embedder." in k}
+        if "proj.weight" not in embedder:
+            raise RuntimeError(f"'{os.path.basename(path)}' has no control embedder weights (control_embedder.proj.*).")
+        lora = {k: v for k, v in sd.items() if "control_embedder." not in k}
+        return AnimaControlLora(embedder, lora, metadata)
+
+    def _apply_anima_control(self, model, adapter, image, strength):
+        """Anima control-LoRA: LoRA deltas + the control tokens (VAE-encoded skeleton through the control embedder)
+        added to the output of the patch embedding. `image` is a PIL image with the generation size. The strength
+        scales both parts, so strength 0 is exactly the base model."""
+        import comfy.patcher_extension
+
+        dit = getattr(model.model, "diffusion_model", None)
+        if dit is None or not hasattr(dit, "x_embedder"):
+            raise RuntimeError("This control adapter only works with Anima/Cosmos models.")
+
+        pixels = self._pil_to_image_tensor(image)[..., :3]
+        latent = self._vae_encode(self.vae_model, pixels)["samples"]  # raw latent, no process_in
+        if latent.ndim == 4:
+            latent = latent.unsqueeze(2)
+
+        weight = adapter.embedder_state["proj.weight"]
+        embedder = AnimaControlEmbedder(in_channels=weight.shape[1] // 4, model_channels=weight.shape[0])
+        embedder.load_state_dict(adapter.embedder_state, strict=False)
+
+        m, _ = comfy.sd.load_lora_for_models(model, None, adapter.lora_state, strength, 0, lora_metadata=adapter.lora_metadata)
+        p = next(dit.parameters())
+        embedder.eval().to(p.device, p.dtype)
+
+        def control_wrapper(executor, *args, **kwargs):
+            tokens = strength * embedder(latent.to(p.device, p.dtype))
+
+            def add_control(_module, _inputs, output):
+                return output + tokens.to(output.device, output.dtype)
+
+            handle = dit.x_embedder.register_forward_hook(add_control)
+            try:
+                return executor(*args, **kwargs)
+            finally:
+                handle.remove()
+
+        m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "anima_control", control_wrapper)
+        return m
 
     @staticmethod
     def _safetensors_keys(path):
@@ -792,6 +865,11 @@ class GenerationParameters():
                 mask = self._crop_like(mask, reference_size, extent)
             image = self._upscale([image], width, height)
             image = [self._preprocess(image[0], unit.get("preprocessor"), unit.get("args"))]
+
+            if isinstance(controlnet, AnimaControlLora):
+                # control-LoRA (e.g. Anima-Control-Pose): the skeleton/control image goes through the VAE
+                model = self._apply_anima_control(model, controlnet, image[0], strength)
+                continue
 
             if hasattr(controlnet, "model_patches_to"):
                 # model patch (Anima LLLite): needs the IMAGE as (1,H,W,3) and an optional (1,H,W) mask
