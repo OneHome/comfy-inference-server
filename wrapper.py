@@ -827,12 +827,14 @@ class GenerationParameters():
             return img.crop(tuple(int(round(v * k)) for v in extent))
         return img
 
-    def _apply_controlnets(self, model, positive, negative, width, height, reference_size=None, extent=None, default_mask=None):
+    def _apply_controlnets(self, model, positive, negative, width, height, reference_size=None, extent=None, default_mask=None, base_reference=None):
         """Apply every ControlNet unit in self.control.
         Classic ControlNets are attached to the conditioning (same logic as ComfyUI's
         ControlNetApplyAdvanced node); model patches (Anima LLLite) patch the MODEL.
         If reference_size/extent are given (inpainting crop), control images that match
         reference_size are cropped with the same extent so they stay aligned.
+        base_reference: PIL image (generation size) of the base image, used as the Cosmos Reference unless a
+        reference unit was added by hand.
         Returns (model, positive, negative)."""
         units = self.control or []
         used = set()
@@ -915,6 +917,9 @@ class GenerationParameters():
                     c.append([t[0], d])
                 out.append(c)
             positive, negative = out
+
+        if base_reference is not None and not any_reference:
+            model = self._apply_cosmos_reference(model, base_reference)
 
         # drop cached ControlNets this request didn't use (they can be big)
         for key in [k for k in self._loaded if k.startswith("controlnet:") and k not in used]:
@@ -1412,6 +1417,10 @@ class GenerationParameters():
             model, positive, negative, width, height,
             reference_size=original_images[0].size, extent=extents[0],
             default_mask=binary_masks[0] if binary_masks else None,
+            base_reference=(
+                self._upscale([self._crop_like(original_images[0], original_images[0].size, extents[0])], width, height)[0]
+                if self.cosmos_reference == "On" else None
+            ),
         )
 
         self.set_status("Upscaling")
