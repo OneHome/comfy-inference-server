@@ -38,6 +38,10 @@ STATIC = ["model_path", "callback", "device_names", "temporary", "device", "_loa
 # Virtual entry shown in the ControlNet list: it is not a model file but an image reference for Anima/Cosmos
 # models (needed by the "Anima Edit" LoRAs). Same idea as Mirumo0u0/ComfyUI-Cosmos-Reference (Apache-2.0).
 REFERENCE_NAME = "Cosmos Reference"
+# Second virtual entry: Anima Reference Adapter (R2I), character/style from a reference image (anima_ref_adapter.py)
+R2I_NAME = "Anima Reference (R2I)"
+R2I_ADAPTER = "anima_ref_adapter_v2_r64.safetensors"  # lives in models/loras, downloaded on first use
+R2I_URL = "https://huggingface.co/ElectronGirl/anima-ref-adapter/resolve/main/" + R2I_ADAPTER
 
 # ---- Anima control-LoRAs (e.g. Claquasse/Anima-Control-Pose): one file holding a LoRA ("lora.*" keys) plus a
 # control embedder ("control_embedder.*" keys). Logic of its AnimaControlApply node, re-implemented here.
@@ -749,6 +753,34 @@ class GenerationParameters():
             raise RuntimeError("This model patch type isn't supported yet (only Anima LLLite is).")
         return nodes_model_patch.AnimaLLLiteApply().apply_patch(model, model_patch, image, strength, start, end, mask)[0]
 
+    def _anima_ref_adapter_path(self):
+        path = folder_paths.get_full_path("loras", R2I_ADAPTER)
+        if path is None:
+            path = os.path.join(folder_paths.get_folder_paths("loras")[0], R2I_ADAPTER)
+            self._download_annotator_file(R2I_URL, path)  # 183 MB, only the first time
+        return path
+
+    def _apply_anima_ref(self, model, image, strength, ref_end):
+        """Anima Reference Adapter (R2I): character and style from a reference image, pose and scene from the prompt.
+        The settings that are not per reference (guidance, correction, size) come from the request."""
+        try:
+            import anima_ref_adapter
+        except ModuleNotFoundError as e:
+            if e.name == "anima_ref_adapter":
+                raise RuntimeError("anima_ref_adapter.py is missing: it must sit next to wrapper.py.")
+            raise
+        dit = getattr(model.model, "diffusion_model", None)
+        if dit is None or not hasattr(dit, "blocks") or not hasattr(dit, "prepare_embedded_sequence"):
+            raise RuntimeError("The reference adapter only works with Anima/Cosmos models.")
+
+        guidance = 4.5 if self.ref_guidance is None else float(self.ref_guidance)
+        correction = self.ref_correction or "apg"
+        megapixels = 1.0 if self.ref_megapixels is None else float(self.ref_megapixels)
+        pixels = self._pil_to_image_tensor(image.convert("RGB"))[..., :3]
+        path = self._anima_ref_adapter_path()
+        self.set_status("Encoding the reference")
+        return anima_ref_adapter.apply(model, self.vae_model, pixels, path, guidance, correction, strength, ref_end, megapixels)
+
     @staticmethod
     def _cosmos_reference_wrapper(executor, *args, **kwargs):
         """Diffusion-model wrapper: append the reference latent(s) as extra "frames" (temporal axis) of the
@@ -839,6 +871,7 @@ class GenerationParameters():
         units = self.control or []
         used = set()
         any_reference = False
+        any_r2i = False
 
         for unit in units:
             image = unit.get("image")
@@ -856,6 +889,13 @@ class GenerationParameters():
                     ref = self._upscale([ref], width, height)[0]
                     model = self._apply_cosmos_reference(model, ref)
                     any_reference = True
+                continue
+
+            if name == R2I_NAME:
+                # the reference is NOT aligned with the target: it keeps its own size and aspect ratio
+                if not any_r2i:
+                    model = self._apply_anima_ref(model, image, strength, end)
+                    any_r2i = True
                 continue
 
             controlnet = self._load_controlnet(name)
@@ -1662,7 +1702,7 @@ class GenerationParameters():
         data["VAE"] = self._get_filenames("vae")
         data["LoRA"] = self._get_filenames("loras")
         data["upscaler"] = self._get_filenames("upscale_models")
-        data["ControlNet"] = [REFERENCE_NAME] + self._get_filenames("controlnet")
+        data["ControlNet"] = [REFERENCE_NAME, R2I_NAME] + self._get_filenames("controlnet")
 
         data["clip_mode"] = [m.name.lower() for m in comfy.sd.CLIPType]
 
