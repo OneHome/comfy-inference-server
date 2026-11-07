@@ -235,6 +235,12 @@ class Inference(threading.Thread):
                     self.wrapper.reset()
                     self.wrapper.set(**request["data"])
                     self.wrapper.annotate()
+                elif request["type"] in ("video", "video_upscale", "video_eta", "video_discard"):
+                    if not hasattr(self.wrapper, request["type"]):
+                        raise RuntimeError("This server can't make videos: start video_server.py instead of server.py.")
+                    self.wrapper.reset()
+                    self.wrapper.set(**request["data"])
+                    getattr(self.wrapper, request["type"])()
                 elif request["type"] == "options":
                     self.wrapper.reset()
                     self.wrapper.options()
