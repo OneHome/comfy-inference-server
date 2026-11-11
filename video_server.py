@@ -10,11 +10,12 @@ It replaces server.py for a session: the two GPUs are used by the video engine, 
 at the same time. qComfy's Video tab talks to it with these request types (see server.py for the transport):
 
     options          -> {"video": {tables for the pickers}}
-    video            -> preview clip (4-step PDMD, low resolution). Replies video_progress..., video_chunk..., video
+    video            -> preview clip (4-step PDMD; "resolution" picks the native size). Replies video_progress..., video_chunk..., video
     video_upscale    -> Open-H3 Regenerate-2K of a preview that is still in memory. Same replies
     video_eta        -> {"text": "..."} estimate for an upscale
     video_discard    -> forget a preview
-    chunk            -> LoRA files uploaded from qComfy (written to the LoRA folder, picked by name afterwards)
+    chunk            -> LoRA files uploaded from qComfy (type "custom": written to <LoRA folder>/custom, picked by name
+                        afterwards with "custom_file" / "s3"; "options" lists them as "uploaded_loras")
 
 Uploaded images and the videos the engine writes stay in a private scratch directory (RAM-backed /dev/shm when it
 has room, otherwise /kaggle/tmp), never in /kaggle/working, and each video is deleted right after it is sent.
@@ -42,6 +43,11 @@ if HERE not in sys.path:
 CHUNK_SIZE = 4 * 1024 * 1024  # a video travels in pieces of this size
 POLL_SECONDS = 0.7
 SAMPLERS = ["euler", "res_multistep"]
+CUSTOM_LORA_DIR = "custom"  # sub-folder of the LoRA folder that receives the LoRA files uploaded from qComfy
+# Native size of the first stage (short side in px, 16:9 grid of 32 px blocks: 384p -> 672x384, the engine's default).
+# The VRAM guard of the engine refuses a size that does not fit and says so.
+RESOLUTIONS = {"384p (default)": 384, "480p": 480, "540p": 540, "576p": 576, "720p": 720}
+DEFAULT_RESOLUTION = "384p (default)"
 SETTINGS_FILE = "h3_2k_settings.json"  # Step 1's choices (model folders and files), as environment variables
 
 
@@ -101,9 +107,24 @@ class VideoWrapper:
                 "no_lora": e.NO_LORA,
                 "preview_steps": e.PREVIEW_STEPS,
                 "default_sampler": e.DEFAULT_SAMPLER,
+                "resolutions": list(RESOLUTIONS),
+                "default_resolution": DEFAULT_RESOLUTION,
+                "uploaded_loras": self._uploaded_loras(),
             }
         }
         self._send("options", data)
+
+    def _uploaded_loras(self):
+        folder = os.path.join(self.model_path, CUSTOM_LORA_DIR)
+        try:
+            return sorted(f"{CUSTOM_LORA_DIR}/{f}" for f in os.listdir(folder) if f.lower().endswith(".safetensors"))
+        except OSError:
+            return []
+
+    @staticmethod
+    def _area(short):
+        width = max(1, round(short * 16 / 9 / 32)) * 32
+        return width * short
 
     # ---- helpers -----------------------------------------------------------------------------------------------
     def _send(self, kind, data):
@@ -130,6 +151,8 @@ class VideoWrapper:
     def _lora_file(self, name):
         if not name:
             return None
+        if not str(name).lower().endswith(".safetensors"):
+            raise RuntimeError(f"The LoRA file '{name}' must be a .safetensors file.")
         path = os.path.abspath(os.path.join(self.model_path, name))
         if not path.startswith(os.path.abspath(self.model_path) + os.sep) or not os.path.isfile(path):
             raise RuntimeError(f"The LoRA file '{name}' was not uploaded to the server.")
@@ -209,7 +232,13 @@ class VideoWrapper:
             (p.get("custom_url") or "").strip(), self._lora_file(p.get("custom_file")), float(p.get("s3", 1.0)),
             bool(p.get("auto_trigger", True)), sampler, float(p.get("shift", 12.0)), int(p.get("steps", 0) or 0),
         )
-        path, status, name = self._run(e.make_preview, *args)
+        resolution = self._choice(p.get("resolution"), list(RESOLUTIONS), "resolution", DEFAULT_RESOLUTION)
+        default_area = e.PREVIEW_AREA
+        e.PREVIEW_AREA = self._area(RESOLUTIONS[resolution])  # preview_size() reads it on every call
+        try:
+            path, status, name = self._run(e.make_preview, *args)
+        finally:
+            e.PREVIEW_AREA = default_area
         if not path:
             raise RuntimeError(status or "The preview could not be generated.")
         eta = ""
@@ -217,7 +246,8 @@ class VideoWrapper:
             eta = e.picker_eta(name, next((o for o in e.OUTPUTS), ""), next(iter(e.REFINE_PRESETS), ""))
         except Exception:
             pass
-        self._deliver(path, "preview", name, status, {"duration": duration, "aspect": aspect, "eta": eta})
+        self._deliver(path, "preview", name, status, {"duration": duration, "aspect": aspect, "eta": eta,
+                                                       "resolution": resolution})
 
     def video_upscale(self):
         """Regenerate a preview that is still in memory at a higher resolution."""
