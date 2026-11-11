@@ -22,6 +22,7 @@ has room, otherwise /kaggle/tmp), never in /kaggle/working, and each video is de
 """
 # the engine's process environment in the notebook: it must be set before torch is imported
 import os
+import re
 
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
 os.environ.setdefault("TQDM_DISABLE", "1")
@@ -43,6 +44,8 @@ if HERE not in sys.path:
 CHUNK_SIZE = 4 * 1024 * 1024  # a video travels in pieces of this size
 POLL_SECONDS = 0.7
 SAMPLERS = ["euler", "res_multistep"]
+MAX_EXTRA_LORAS = 8   # uploaded files + links a single clip may use, on top of the two catalog LoRAs
+HF_SHORT = re.compile(r"^([\w.-]+/[\w.-]+)/(.+\.safetensors)$")   # user/repo/path/file.safetensors
 CUSTOM_LORA_DIR = "custom"  # sub-folder of the LoRA folder that receives the LoRA files uploaded from qComfy
 # Native size of the first stage (short side in px, 16:9 grid of 32 px blocks: 384p -> 672x384, the engine's default).
 # The VRAM guard of the engine refuses a size that does not fit and says so.
@@ -69,6 +72,8 @@ class VideoWrapper:
         self.params = {}
         self.model_path = engine.LORA_DIR  # LoRA files uploaded from qComfy end up here
         os.makedirs(self.model_path, exist_ok=True)
+        self._extra_loras = []
+        self._install_lora_hook()
 
     # ---- interface used by server.Inference --------------------------------------------------------------------
     def reset(self):
@@ -107,6 +112,7 @@ class VideoWrapper:
                 "no_lora": e.NO_LORA,
                 "preview_steps": e.PREVIEW_STEPS,
                 "default_sampler": e.DEFAULT_SAMPLER,
+                "max_extra_loras": MAX_EXTRA_LORAS,
                 "resolutions": list(RESOLUTIONS),
                 "default_resolution": DEFAULT_RESOLUTION,
                 "uploaded_loras": self._uploaded_loras(),
@@ -157,6 +163,45 @@ class VideoWrapper:
         if not path.startswith(os.path.abspath(self.model_path) + os.sep) or not os.path.isfile(path):
             raise RuntimeError(f"The LoRA file '{name}' was not uploaded to the server.")
         return path
+
+    def _fetch_link(self, link):
+        """Download a LoRA from a link into the LoRA folder (Hugging Face and mirrors, or any direct .safetensors URL)."""
+        link = str(link).strip()
+        if "://" not in link and HF_SHORT.match(link):
+            from huggingface_hub import hf_hub_download
+            m = HF_SHORT.match(link)
+            return hf_hub_download(repo_id=m.group(1), filename=m.group(2), local_dir=self.model_path)
+        if not re.match(r"^https?://", link):
+            raise RuntimeError("A LoRA link must start with https:// (or be user/repo/file.safetensors).")
+        return self.engine.fetch_lora(link)
+
+    def _resolve_lora(self, entry):
+        if entry.get("file"):
+            return self._lora_file(entry["file"])
+        if entry.get("url"):
+            return self._fetch_link(entry["url"])
+        return None
+
+    def _install_lora_hook(self):
+        """Lets a clip use any number of extra LoRAs on top of the engine's two catalog slots and its single custom one.
+        The engine builds {key: (path, strength)} in _user_loras and applies the whole dict, so extra entries just join it."""
+        e, wrapper = self.engine, self
+        original = getattr(e._user_loras, "_original", e._user_loras)
+
+        def user_loras_multi(*args, **kwargs):
+            selections, triggers = original(*args, **kwargs)
+            for entry in list(wrapper._extra_loras):
+                path = wrapper._resolve_lora(entry)
+                strength = float(entry.get("strength", 1.0))
+                if path and strength != 0.0:
+                    key = f"custom:{os.path.basename(path)}"
+                    while key in selections:
+                        key += "+"
+                    selections[key] = (path, strength)
+            return selections, triggers
+
+        user_loras_multi._original = original
+        e._user_loras = user_loras_multi
 
     def _run(self, job, *args):
         """Run an engine call while a thread reports its progress and watches for a cancel."""
@@ -233,12 +278,17 @@ class VideoWrapper:
             bool(p.get("auto_trigger", True)), sampler, float(p.get("shift", 12.0)), int(p.get("steps", 0) or 0),
         )
         resolution = self._choice(p.get("resolution"), list(RESOLUTIONS), "resolution", DEFAULT_RESOLUTION)
+        extras = [x for x in (p.get("custom_loras") or []) if isinstance(x, dict) and (x.get("file") or x.get("url"))]
+        if len(extras) > MAX_EXTRA_LORAS:
+            raise RuntimeError(f"At most {MAX_EXTRA_LORAS} extra LoRAs per clip.")
+        self._extra_loras = extras
         default_area = e.PREVIEW_AREA
         e.PREVIEW_AREA = self._area(RESOLUTIONS[resolution])  # preview_size() reads it on every call
         try:
             path, status, name = self._run(e.make_preview, *args)
         finally:
             e.PREVIEW_AREA = default_area
+            self._extra_loras = []
         if not path:
             raise RuntimeError(status or "The preview could not be generated.")
         eta = ""
