@@ -332,6 +332,22 @@ class VideoWrapper:
         self._send("video_discarded", {"name": name, "files": removed})
 
 
+class PromptHider:
+    """stdout wrapper: the engine prints the full prompt (scene, spoken line, sound, music) before every clip.
+    That block is replaced by a placeholder so it does not show up in the Kaggle cell output."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        if isinstance(text, str) and text.startswith("\U0001f4dd") and ("=" * 70) in text:
+            text = "\U0001f4dd (prompt hidden)\n" + "=" * 70
+        return self._stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def main():
     import server  # the same transport (encrypted websocket, queue, uploads) the image server uses
 
@@ -340,7 +356,10 @@ def main():
     parser.add_argument("--password", type=str, default=server.DEFAULT_PASSWORD,
                         help="password to derive encryption key from")
     parser.add_argument("--workdir", type=str, default="/kaggle/working", help="folder that contains Wan2GP")
+    parser.add_argument("--show-prompts", action="store_true", help="print the prompts in the server output (hidden by default)")
     args = parser.parse_args()
+    if not args.show_prompts:
+        sys.stdout = PromptHider(sys.stdout)
 
     os.chdir(args.workdir)
     load_notebook_settings(args.workdir)
