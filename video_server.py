@@ -31,6 +31,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import io
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -243,6 +244,7 @@ class VideoWrapper:
         """Send the MP4 in pieces, then a final 'video' message, and delete the file."""
         with open(path, "rb") as f:
             data = f.read()
+        info = probe_clip(path)
         try:
             os.remove(path)
         except OSError:
@@ -252,7 +254,7 @@ class VideoWrapper:
         for i in range(total):
             self._send("video_chunk", {"id": vid, "index": i, "total": total,
                                        "data": data[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]})
-        self._send("video", {"id": vid, "name": name, "kind": kind, "status": status, "size": len(data), **(extra or {})})
+        self._send("video", {"id": vid, "name": name, "kind": kind, "status": status, "size": len(data), **(extra or {}), **info})
 
     # ---- requests ----------------------------------------------------------------------------------------------
     def video(self):
@@ -330,6 +332,30 @@ class VideoWrapper:
                 except OSError:
                     pass
         self._send("video_discarded", {"name": name, "files": removed})
+
+
+def probe_clip(path):
+    """Size/length and a small JPEG poster frame of a clip, for qComfy's gallery. {} entries are simply left out."""
+    info = {}
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=width,height", "-show_entries", "format=duration", "-of", "json", path],
+                             capture_output=True, text=True, timeout=30)
+        data = json.loads(out.stdout)
+        stream = (data.get("streams") or [{}])[0]
+        info["width"], info["height"] = int(stream["width"]), int(stream["height"])
+        info["seconds"] = round(float(data["format"]["duration"]), 2)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-frames:v", "1", "-vf", "scale=-2:240",
+                              "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "4", "-"],
+                             capture_output=True, timeout=30)
+        if out.returncode == 0 and out.stdout:
+            info["poster"] = out.stdout
+    except Exception:
+        pass
+    return info
 
 
 class PromptHider:
