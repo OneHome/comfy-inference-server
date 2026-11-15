@@ -7,7 +7,9 @@ notebook author's code, used with his permission. This script takes it out of th
 what a qComfy server needs, so that a newer version of the notebook can be converted the same way:
   * the Gradio interface, the job runner and the tunnel are removed (qComfy talks to video_server.py instead);
   * everything the engine writes (videos, previews, start/end frames, latents) goes to a private scratch directory
-    (RAM-backed /dev/shm when it is big enough, else /kaggle/tmp) and NOT to /kaggle/working/outputs.
+    (RAM-backed /dev/shm when it is big enough, else /kaggle/tmp) and NOT to /kaggle/working/outputs;
+  * an experimental Ref2VA mode (REF2VA_PATCHES below): with H3_MODE=ref2va the engine loads the Ref2VA transformer and
+    the LightX2V Ref2V Turbo LoRA and a clip can use reference images. Without that variable nothing changes.
 """
 import json
 import re
@@ -45,6 +47,143 @@ shutil_rmtree(OUTPUT_DIR, ignore_errors=True)  # start clean: nothing from a pre
 '''
 
 
+
+# ---- Ref2VA mode (experimental) -------------------------------------------------------------------------------------
+# H3_MODE=ref2va loads the Ref2VA transformer instead of FL2VA and lets a clip use reference images. Without that
+# environment variable nothing changes. Each entry is (old text, new text) and must match exactly once.
+REF2VA_PATCHES = [
+    # 1. mode, checkpoint
+    ('''DIT_FILE = os.environ.get("H3_DIT_FILE", "MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors")
+''', '''H3_MODE = os.environ.get("H3_MODE", "fl2va").strip().lower()  # "fl2va": text / first / last frame. "ref2va": reference images
+if H3_MODE not in ("fl2va", "ref2va"):
+    raise SystemExit(f"❌ H3_MODE must be fl2va or ref2va, not {H3_MODE!r}")
+REF2VA = H3_MODE == "ref2va"
+DIT_FILE = os.environ.get("H3_DIT_FILE", "MiniMax-H3-Ref2VA-pruned_rank8_int8_convrot.safetensors" if REF2VA
+                          else "MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors")
+'''),
+    # 2. preview distillation LoRA
+    ('''PDMD_FILE = os.path.join(LORA_DIR, "pdmd_4nfe", "lora_model_0.safetensors")  # PDMD 4-step distillation LoRA
+''', '''PDMD_FILE = os.path.join(LORA_DIR, "pdmd_4nfe", "lora_model_0.safetensors")  # PDMD 4-step distillation LoRA
+# LightX2V Ref2VA Turbo 4-step (trained with video shift 12, 4 steps): the distillation LoRA made for the Ref2VA transformer
+REF2V_TURBO_FILE = os.environ.get("H3_REF2V_LORA", os.path.join(
+    LORA_DIR, "ref2v_turbo", "minimax_h3_lightx2v_ref2v_turbo_4step_alpha8_v0.1_bf16.safetensors"))
+DISTILL_FILE = REF2V_TURBO_FILE if REF2VA else PDMD_FILE
+'''),
+    ('''MODEL_TYPE = "minimax_h3_fl2va_pruned"
+''', '''MODEL_TYPE = "minimax_h3_ref2va_pruned" if REF2VA else "minimax_h3_fl2va_pruned"
+'''),
+    ('''if not os.path.exists(PDMD_FILE):
+    raise SystemExit(f"❌ The PDMD LoRA is missing ({PDMD_FILE}): re-run Step 1, then Step 2.")
+''', '''if not os.path.exists(DISTILL_FILE):
+    raise SystemExit(f"❌ The preview distillation LoRA is missing ({DISTILL_FILE}): "
+                     + ("run get_ref2va_files.py first." if REF2VA else "re-run Step 1, then Step 2."))
+if REF2VA and not os.path.exists(os.path.join(MODELS_DIR, DIT_FILE)):
+    raise SystemExit(f"❌ The Ref2VA transformer is missing ({os.path.join(MODELS_DIR, DIT_FILE)}): run get_ref2va_files.py first.")
+'''),
+    # 3. the pipeline has to be in reference mode
+    ('''transformer = pipeline.transformer
+transformer.cache = None
+''', '''transformer = pipeline.transformer
+transformer.cache = None
+print(f"MiniMax H3 mode: {H3_MODE} | {MODEL_TYPE} | pipeline.reference_mode = {getattr(pipeline, 'reference_mode', None)}")
+if REF2VA and not getattr(pipeline, "reference_mode", False):
+    raise SystemExit("❌ The Ref2VA checkpoint was loaded without reference mode (see the line above).")
+'''),
+    ('''DISTILL_KEY = "⚡ PDMD 4-step"
+''', '''DISTILL_KEY = "⚡ Ref2V Turbo 4-step" if REF2VA else "⚡ PDMD 4-step"
+'''),
+    ('''LORA_PATHS = {DISTILL_KEY: PDMD_FILE, REFINE_KEY: REFINE_LORA_FILE}
+''', '''LORA_PATHS = {DISTILL_KEY: DISTILL_FILE, REFINE_KEY: REFINE_LORA_FILE}
+'''),
+    # 4. VRAM estimate counts the reference images
+    ('''def estimate_rows(w, h, frames, images_in_prompt):
+''', '''def estimate_rows(w, h, frames, images_in_prompt, refs=0, ref_size=100):
+'''),
+    ('''    return video + audio + images_in_prompt * per_frame + text
+''', '''    ref_rows = int(refs * per_frame * ref_size / 100) * 2  # each reference image: its latent tokens + its Qwen vision tokens
+    return video + audio + images_in_prompt * per_frame + text + ref_rows
+'''),
+    # 5. generation call
+    ('''def run_generation(prompt_text, frames, w, h, steps, sampler, shift, seed, start_img=None, end_img=None):
+''', '''def run_generation(prompt_text, frames, w, h, steps, sampler, shift, seed, start_img=None, end_img=None, refs=None, ref_size=100):
+'''),
+    ('''    if end_img is not None:
+        kwargs["image_end"] = _to_video_tensor(end_img)
+    report(0.01, "⚡ Preparing...")
+''', '''    if end_img is not None:
+        kwargs["image_end"] = _to_video_tensor(end_img)
+    if refs:
+        kwargs["input_ref_images"] = list(refs)           # Ref2VA reference images (PIL), in the order of <Picture N>
+        kwargs["video_prompt_type"] = "I"                 # image references; the output size is the one chosen here
+        kwargs["image_refs_relative_size"] = int(ref_size)  # reference pixel budget, % of the output frame
+    report(0.01, "⚡ Preparing...")
+'''),
+    # 6. make_preview
+    ('''                 s2, custom_url, custom_file, s3, auto_trigger, sampler, shift, custom_steps):
+''', '''                 s2, custom_url, custom_file, s3, auto_trigger, sampler, shift, custom_steps, refs=None, ref_names="", ref_size=100):
+'''),
+    ('''        if not (prompt or "").strip() and start_img is None:
+            return None, "❌ Please write a prompt.", None
+''', '''        refs = list(refs or [])
+        if refs and not REF2VA:
+            return None, "❌ Reference images need a server started in Ref2VA mode (H3_MODE=ref2va).", None
+        if not (prompt or "").strip() and start_img is None and not refs:
+            return None, "❌ Please write a prompt.", None
+'''),
+    ('''        w, h, ratio = preview_size(aspect, start_img if start_img is not None else end_img)
+''', '''        w, h, ratio = preview_size(aspect, start_img if start_img is not None else end_img if end_img is not None
+                                   else (refs[0] if refs else None))
+'''),
+    ('''        rows = estimate_rows(w, h, frames, images_in_prompt)
+        frees = free_for_denoise()
+''', '''        rows = estimate_rows(w, h, frames, images_in_prompt, len(refs), ref_size)
+        frees = free_for_denoise()
+'''),
+    ('''has_end, 0, "", False, triggers)
+''', '''has_end, len(refs), ref_names, False, triggers)
+'''),
+    ('''                else "Image → Video" if start_img is not None else "Last Frame → Video" if end_img is not None else "Text → Video")
+''', '''                else "Image → Video" if start_img is not None else "Last Frame → Video" if end_img is not None else "Text → Video")
+        if refs:
+            mode = f"Reference × {len(refs)}" + (" + frames" if images_in_prompt else "") + " → Video"
+'''),
+    ('''run_generation(final_prompt, frames, w, h, steps, sampler, shift, seed, start_img, end_img)
+''', '''run_generation(final_prompt, frames, w, h, steps, sampler, shift, seed, start_img, end_img, refs, ref_size)
+'''),
+    ('''        if "latent" not in CAPTURE or "context" not in CAPTURE:
+''', '''        if "latent" not in CAPTURE or ("context" not in CAPTURE and not REF2VA):  # Ref2VA previews are not upscaled
+'''),
+    ('''torch.save({"latent": CAPTURE["latent"], "context": CAPTURE["context"], "text_tags": CAPTURE["text_tags"],
+''', '''torch.save({"latent": CAPTURE["latent"], "context": CAPTURE.get("context"), "text_tags": CAPTURE.get("text_tags"),
+'''),
+    ('''                       "keyframes": images_in_prompt}, f)
+''', '''                       "keyframes": images_in_prompt, "references": len(refs)}, f)
+'''),
+    # 7. upscaling: the Open-H3 refiner was built for FL2VA
+    ('''    t0 = time.time()
+    try:
+        if not name:
+            return None, "❌ Make a preview first (or pick one in 🎞️ Preview to upscale)."
+''', '''    t0 = time.time()
+    try:
+        if REF2VA and os.environ.get("H3_REF2VA_UPSCALE", "0") != "1":
+            return None, ("❌ Upscaling is not available in Ref2VA mode: the Open-H3 refiner was built for the FL2VA transformer "
+                          "(set H3_REF2VA_UPSCALE=1 to try it anyway).")
+        if not name:
+            return None, "❌ Make a preview first (or pick one in 🎞️ Preview to upscale)."
+'''),
+]
+
+
+def apply_ref2va(text):
+    for old, new in REF2VA_PATCHES:
+        found = text.count(old)
+        if found != 1:
+            raise SystemExit(f"Ref2VA patch matched {found} times, expected 1: {old[:70]!r}")
+        text = text.replace(old, new)
+    return text
+
+
 def once(text, pattern, repl, flags=0):
     found = re.findall(pattern, text, flags)
     if len(found) != 1:
@@ -75,6 +214,7 @@ def main(notebook, out):
     text = once(text, r"^import gradio as gr\n", "", re.M)
     text = once(text, r"^os\.environ\.setdefault\(\"GRADIO_TEMP_DIR\".*\n", "", re.M)
     text = once(text, r"^OUTPUT_DIR = .*\n", PRIVATE_DIR, re.M)
+    text = apply_ref2va(text)                       # H3_MODE=ref2va: reference images (inactive unless that variable is set)
     text = HEADER + text
 
     open(out, "w", encoding="utf-8").write(text)

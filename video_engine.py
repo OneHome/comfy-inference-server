@@ -73,9 +73,18 @@ shutil_rmtree(OUTPUT_DIR, ignore_errors=True)  # start clean: nothing from a pre
 MODELS_DIR = os.environ.get("H3_MODELS_DIR", "/kaggle/tmp/h3_models")
 LORA_DIR = os.environ.get("H3_LORA_DIR", "/kaggle/tmp/h3_loras")
 REGEN_DIR = os.environ.get("H3_REGEN_DIR", "/kaggle/tmp/h3_regen")
-DIT_FILE = os.environ.get("H3_DIT_FILE", "MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors")
+H3_MODE = os.environ.get("H3_MODE", "fl2va").strip().lower()  # "fl2va": text / first / last frame. "ref2va": reference images
+if H3_MODE not in ("fl2va", "ref2va"):
+    raise SystemExit(f"❌ H3_MODE must be fl2va or ref2va, not {H3_MODE!r}")
+REF2VA = H3_MODE == "ref2va"
+DIT_FILE = os.environ.get("H3_DIT_FILE", "MiniMax-H3-Ref2VA-pruned_rank8_int8_convrot.safetensors" if REF2VA
+                          else "MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors")
 TE_FILE = os.environ.get("H3_TE_FILE", "qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
 PDMD_FILE = os.path.join(LORA_DIR, "pdmd_4nfe", "lora_model_0.safetensors")  # PDMD 4-step distillation LoRA
+# LightX2V Ref2VA Turbo 4-step (trained with video shift 12, 4 steps): the distillation LoRA made for the Ref2VA transformer
+REF2V_TURBO_FILE = os.environ.get("H3_REF2V_LORA", os.path.join(
+    LORA_DIR, "ref2v_turbo", "minimax_h3_lightx2v_ref2v_turbo_4step_alpha8_v0.1_bf16.safetensors"))
+DISTILL_FILE = REF2V_TURBO_FILE if REF2VA else PDMD_FILE
 REFINE_LORA_FILE = os.path.join(REGEN_DIR, "open_h3_regenerate_2k_lora_int8.safetensors")
 SHARP_FILE = os.path.join(REGEN_DIR, "open_h3_sharp_curve_deltas.safetensors")
 UPSCALER_FILE = os.path.join(REGEN_DIR, "latent_upsampler", "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")
@@ -349,11 +358,14 @@ h3_main._load_text_encoder = lambda filename, dtype: _orig_load_text_encoder(fil
 
 # ==== Load the model ====
 # The Open-H3 refiner LoRA was trained on the base T2VA transformer, so both stages share the FL2VA partition.
-MODEL_TYPE = "minimax_h3_fl2va_pruned"
+MODEL_TYPE = "minimax_h3_ref2va_pruned" if REF2VA else "minimax_h3_fl2va_pruned"
 DEFAULT_SAMPLER = "euler"
 PREVIEW_STEPS = 4  # PDMD 4-step: Euler, video shift 12 (its sampling setting)
-if not os.path.exists(PDMD_FILE):
-    raise SystemExit(f"❌ The PDMD LoRA is missing ({PDMD_FILE}): re-run Step 1, then Step 2.")
+if not os.path.exists(DISTILL_FILE):
+    raise SystemExit(f"❌ The preview distillation LoRA is missing ({DISTILL_FILE}): "
+                     + ("run get_ref2va_files.py first." if REF2VA else "re-run Step 1, then Step 2."))
+if REF2VA and not os.path.exists(os.path.join(MODELS_DIR, DIT_FILE)):
+    raise SystemExit(f"❌ The Ref2VA transformer is missing ({os.path.join(MODELS_DIR, DIT_FILE)}): run get_ref2va_files.py first.")
 print("\n📦 Loading the MiniMax H3 base transformer INT8 ConvRot + Qwen3-VL-32B GGUF...")
 sys.stdout.flush()
 _t_load = time.time()
@@ -372,6 +384,9 @@ pipeline, _ = family_handler.load_model(
 )
 transformer = pipeline.transformer
 transformer.cache = None
+print(f"MiniMax H3 mode: {H3_MODE} | {MODEL_TYPE} | pipeline.reference_mode = {getattr(pipeline, 'reference_mode', None)}")
+if REF2VA and not getattr(pipeline, "reference_mode", False):
+    raise SystemExit("❌ The Ref2VA checkpoint was loaded without reference mode (see the line above).")
 
 # Modules H3 pins to FP32 (patch projections, output heads, AdaLN curve projections) are converted here,
 # since this transformer is not handed to MMGP's profile (which would otherwise apply the locks).
@@ -1447,9 +1462,9 @@ pipeline.audio_vae.decode = _audio_decode
 # 0.1-25% of a distillation LoRA's effect survived). The refine LoRA is NVIDIA's merged rank-576 adapter (Open-H3
 # refiner + LightX2V FL2VA Turbo v1.2 + LMS Sharp), ~1.9 GB per GPU even as INT8. It is loaded when an upscale starts
 # (~45 s) and dropped again before the VAE decode: a 2K decode needs that VRAM next to the decoder, and previews keep it.
-DISTILL_KEY = "⚡ PDMD 4-step"
+DISTILL_KEY = "⚡ Ref2V Turbo 4-step" if REF2VA else "⚡ PDMD 4-step"
 REFINE_KEY = "🔍 Open-H3 Regenerate 2K"
-LORA_PATHS = {DISTILL_KEY: PDMD_FILE, REFINE_KEY: REFINE_LORA_FILE}
+LORA_PATHS = {DISTILL_KEY: DISTILL_FILE, REFINE_KEY: REFINE_LORA_FILE}
 REFINE_LORA_BYTES = int(0.62 * os.path.getsize(REFINE_LORA_FILE))  # per GPU: each shard keeps its half of B or A
 lora_runtime.q8_keys.update(LORA_PATHS)
 
@@ -1728,12 +1743,13 @@ def output_size(ratio, short):
     return (out_w, out_h), (math.ceil(out_w / 32) * 32, math.ceil(out_h / 32) * 32)
 
 
-def estimate_rows(w, h, frames, images_in_prompt):
+def estimate_rows(w, h, frames, images_in_prompt, refs=0, ref_size=100):
     per_frame = (h // 32) * (w // 32)
     video = h3_pipeline.video_latent_frames(frames) * per_frame
     audio = round(frames / 24 * 40) * 2
     text = 1200 + images_in_prompt * per_frame  # prompt tokens + Qwen vision tokens of each picture
-    return video + audio + images_in_prompt * per_frame + text
+    ref_rows = int(refs * per_frame * ref_size / 100) * 2  # each reference image: its latent tokens + its Qwen vision tokens
+    return video + audio + images_in_prompt * per_frame + text + ref_rows
 
 
 def free_for_denoise():
@@ -1948,7 +1964,7 @@ pipeline._encode_prompt = _encode_prompt_capture
 
 
 @torch.inference_mode()
-def run_generation(prompt_text, frames, w, h, steps, sampler, shift, seed, start_img=None, end_img=None):
+def run_generation(prompt_text, frames, w, h, steps, sampler, shift, seed, start_img=None, end_img=None, refs=None, ref_size=100):
     pipeline._interrupt = False
     t0 = time.time()
     timings = {"text": 0.0, "denoise": 0.0, "decode": 0.0}
@@ -1999,6 +2015,10 @@ def run_generation(prompt_text, frames, w, h, steps, sampler, shift, seed, start
         kwargs["image_start"] = _to_video_tensor(start_img)
     if end_img is not None:
         kwargs["image_end"] = _to_video_tensor(end_img)
+    if refs:
+        kwargs["input_ref_images"] = list(refs)           # Ref2VA reference images (PIL), in the order of <Picture N>
+        kwargs["video_prompt_type"] = "I"                 # image references; the output size is the one chosen here
+        kwargs["image_refs_relative_size"] = int(ref_size)  # reference pixel budget, % of the output frame
     report(0.01, "⚡ Preparing...")
     BAR.start("prep", "Preparing inputs")
     PROGRESS.update(decode_base=0.86, decode_span=0.11)
@@ -2087,17 +2107,21 @@ def on_main_gpu(fn):
 
 @on_main_gpu
 def make_preview(prompt, dialogue, language, sound, music, start_img, end_img, aspect, duration, seed, lora1, s1, lora2,
-                 s2, custom_url, custom_file, s3, auto_trigger, sampler, shift, custom_steps):
+                 s2, custom_url, custom_file, s3, auto_trigger, sampler, shift, custom_steps, refs=None, ref_names="", ref_size=100):
     """Returns (preview MP4 path or None, status, preview name or None)."""
     import json
     import soundfile as sf
 
     try:
-        if not (prompt or "").strip() and start_img is None:
+        refs = list(refs or [])
+        if refs and not REF2VA:
+            return None, "❌ Reference images need a server started in Ref2VA mode (H3_MODE=ref2va).", None
+        if not (prompt or "").strip() and start_img is None and not refs:
             return None, "❌ Please write a prompt.", None
         frames = DURATIONS[duration]
         steps = int(custom_steps) if custom_steps and int(custom_steps) > 0 else PREVIEW_STEPS
-        w, h, ratio = preview_size(aspect, start_img if start_img is not None else end_img)
+        w, h, ratio = preview_size(aspect, start_img if start_img is not None else end_img if end_img is not None
+                                   else (refs[0] if refs else None))
         if seed is None or int(seed) < 0:
             seed = random.randint(0, 2**31 - 1)
         seed = int(seed)
@@ -2108,7 +2132,7 @@ def make_preview(prompt, dialogue, language, sound, music, start_img, end_img, a
         set_stage("preview")
 
         images_in_prompt = (start_img is not None) + (end_img is not None)
-        rows = estimate_rows(w, h, frames, images_in_prompt)
+        rows = estimate_rows(w, h, frames, images_in_prompt, len(refs), ref_size)
         frees = free_for_denoise()
         LONG_VIDEO["on"] = needed_bytes(rows) > min(frees)
         if needed_bytes(rows, LONG_VIDEO["on"]) > min(frees):
@@ -2116,10 +2140,12 @@ def make_preview(prompt, dialogue, language, sound, music, start_img, end_img, a
                           f"but only {_gb(frees[0])} (GPU 0) / {_gb(frees[1])} (GPU 1) is free. Pick a shorter duration."), None
 
         build = lambda has_start, has_end: build_prompt(prompt, dialogue, language, sound, music, frames / 24, has_start,
-                                                       has_end, 0, "", False, triggers)
+                                                       has_end, len(refs), ref_names, False, triggers)
         final_prompt = build(start_img is not None, end_img is not None)
         mode = ("First + Last Frame → Video" if start_img is not None and end_img is not None
                 else "Image → Video" if start_img is not None else "Last Frame → Video" if end_img is not None else "Text → Video")
+        if refs:
+            mode = f"Reference × {len(refs)}" + (" + frames" if images_in_prompt else "") + " → Video"
         print(f"\n{'=' * 70}\n🎬 Preview | {mode} | {w}x{h} | {frames / 24:.1f}s | {steps} steps | seed {seed}")
         if user:
             print("🎨 LoRAs: " + ", ".join(f"{k} @ {v[1]:.2f}" for k, v in user.items()))
@@ -2130,10 +2156,10 @@ def make_preview(prompt, dialogue, language, sound, music, start_img, end_img, a
             torch.cuda.reset_peak_memory_stats(dev)
         PEAKS.clear()
         CAPTURE.clear()
-        video, audio, sr, timings = run_generation(final_prompt, frames, w, h, steps, sampler, shift, seed, start_img, end_img)
+        video, audio, sr, timings = run_generation(final_prompt, frames, w, h, steps, sampler, shift, seed, start_img, end_img, refs, ref_size)
         if video is None:
             return None, "⏹️ Generation stopped.", None
-        if "latent" not in CAPTURE or "context" not in CAPTURE:
+        if "latent" not in CAPTURE or ("context" not in CAPTURE and not REF2VA):  # Ref2VA previews are not upscaled
             raise RuntimeError("the preview latent or prompt states were not captured")
 
         report(0.97, "💾 Saving MP4...")
@@ -2153,13 +2179,13 @@ def make_preview(prompt, dialogue, language, sound, music, start_img, end_img, a
             path = os.path.join(PREVIEW_DIR, f"{name}_{tag}.png")
             img.convert("RGB").save(path)
             images.append(path)
-        torch.save({"latent": CAPTURE["latent"], "context": CAPTURE["context"], "text_tags": CAPTURE["text_tags"],
+        torch.save({"latent": CAPTURE["latent"], "context": CAPTURE.get("context"), "text_tags": CAPTURE.get("text_tags"),
                     "prompt": final_prompt, "text_prompt": build(False, False), "frames": frames, "w": w, "h": h,
                     "ratio": ratio, "seed": seed, "loras": user, "images": images, "wav": wav, "video": out_path}, pt_path)
         label = f"{time.strftime('%H:%M:%S')} · {(prompt or mode).strip()[:48]} · {w}x{h} · {frames / 24:.1f}s · seed {seed}"
         with open(meta_path, "w") as f:
             json.dump({"name": name, "label": label, "frames": frames, "ratio": ratio, "w": w, "h": h,
-                       "keyframes": images_in_prompt}, f)
+                       "keyframes": images_in_prompt, "references": len(refs)}, f)
         total = timings.get("total", 0.0)
         per_step = timings["denoise"] / max(1, steps)
         print(f"✅ Preview saved in {total:.0f}s (prompt {timings['text']:.0f}s + denoise {timings['denoise']:.0f}s + "
@@ -2237,6 +2263,9 @@ def make_upscale(name, target, preset, refine_seed, anchor):
     """Returns (MP4 path or None, status)."""
     t0 = time.time()
     try:
+        if REF2VA and os.environ.get("H3_REF2VA_UPSCALE", "0") != "1":
+            return None, ("❌ Upscaling is not available in Ref2VA mode: the Open-H3 refiner was built for the FL2VA transformer "
+                          "(set H3_REF2VA_UPSCALE=1 to try it anyway).")
         if not name:
             return None, "❌ Make a preview first (or pick one in 🎞️ Preview to upscale)."
         if target not in OUTPUTS:

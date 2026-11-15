@@ -11,6 +11,8 @@ at the same time. qComfy's Video tab talks to it with these request types (see s
 
     options          -> {"video": {tables for the pickers}}
     video            -> preview clip (4-step PDMD; "resolution" picks the native size). Replies video_progress..., video_chunk..., video
+                        In Ref2VA mode (H3_MODE=ref2va, see README) it also takes "refs" (reference images, in the order of
+                        <Picture N>), "ref_names" (comma separated names of the subjects) and "ref_size" (% of the frame)
     video_upscale    -> Open-H3 Regenerate-2K of a preview that is still in memory. Same replies
     video_eta        -> {"text": "..."} estimate for an upscale
     video_discard    -> forget a preview
@@ -52,6 +54,9 @@ CUSTOM_LORA_DIR = "custom"  # sub-folder of the LoRA folder that receives the Lo
 # The VRAM guard of the engine refuses a size that does not fit and says so.
 RESOLUTIONS = {"384p (default)": 384, "480p": 480, "540p": 540, "576p": 576, "720p": 720}
 DEFAULT_RESOLUTION = "384p (default)"
+MAX_REFS = int(os.environ.get("H3_MAX_REFS", "4"))   # reference images per clip (Wan2GP allows 9; two T4 have little room)
+REF_SIZE_RANGE = (50, 200)                           # reference pixel budget, % of the output frame (Wan2GP: 50-400)
+DEFAULT_REF_SIZE = 70
 SETTINGS_FILE = "h3_2k_settings.json"  # Step 1's choices (model folders and files), as environment variables
 
 
@@ -117,6 +122,10 @@ class VideoWrapper:
                 "resolutions": list(RESOLUTIONS),
                 "default_resolution": DEFAULT_RESOLUTION,
                 "uploaded_loras": self._uploaded_loras(),
+                "mode": getattr(e, "H3_MODE", "fl2va"),
+                "references": {"enabled": bool(getattr(e, "REF2VA", False)), "max_images": MAX_REFS if getattr(e, "REF2VA", False) else 0,
+                               "size": {"min": REF_SIZE_RANGE[0], "max": REF_SIZE_RANGE[1], "default": DEFAULT_REF_SIZE}},
+                "upscale": not getattr(e, "REF2VA", False) or os.environ.get("H3_REF2VA_UPSCALE", "0") == "1",
             }
         }
         self._send("options", data)
@@ -262,8 +271,20 @@ class VideoWrapper:
         e, p = self.engine, self.params
         start_img, end_img = self._image(p.get("start_img")), self._image(p.get("end_img"))
         prompt = (p.get("prompt") or "").strip()
-        if not prompt and start_img is None and end_img is None:
-            raise RuntimeError("Write a prompt or give a start image.")
+        refs = [self._image(r) for r in (p.get("refs") or []) if r]
+        if refs and not getattr(e, "REF2VA", False):
+            raise RuntimeError("This server runs in FL2VA mode: reference images need the Ref2VA notebook (H3_MODE=ref2va).")
+        if len(refs) > MAX_REFS:
+            raise RuntimeError(f"At most {MAX_REFS} reference images per clip on this server.")
+        names = p.get("ref_names") or ""
+        ref_names = ", ".join(str(n).strip() for n in names if str(n).strip()) if isinstance(names, (list, tuple)) else str(names)
+        try:
+            ref_size = int(p.get("ref_size", DEFAULT_REF_SIZE))
+        except (TypeError, ValueError):
+            ref_size = DEFAULT_REF_SIZE
+        ref_size = max(REF_SIZE_RANGE[0], min(REF_SIZE_RANGE[1], ref_size))
+        if not prompt and start_img is None and end_img is None and not refs:
+            raise RuntimeError("Write a prompt, give a start image or add a reference image.")
         aspect = self._choice(p.get("aspect"), list(e.ASPECTS), "aspect ratio", next(iter(e.ASPECTS)))
         duration = self._choice(p.get("duration"), list(e.DURATIONS), "duration", "5 s" if "5 s" in e.DURATIONS else None)
         language = self._choice(p.get("language"), e.LANGUAGES, "language", "English")
@@ -278,6 +299,7 @@ class VideoWrapper:
             lora1, float(p.get("s1", 1.0)), lora2, float(p.get("s2", 1.0)),
             (p.get("custom_url") or "").strip(), self._lora_file(p.get("custom_file")), float(p.get("s3", 1.0)),
             bool(p.get("auto_trigger", True)), sampler, float(p.get("shift", 12.0)), int(p.get("steps", 0) or 0),
+            refs, ref_names, ref_size,
         )
         resolution = self._choice(p.get("resolution"), list(RESOLUTIONS), "resolution", DEFAULT_RESOLUTION)
         extras = [x for x in (p.get("custom_loras") or []) if isinstance(x, dict) and (x.get("file") or x.get("url"))]
@@ -299,7 +321,8 @@ class VideoWrapper:
         except Exception:
             pass
         self._deliver(path, "preview", name, status, {"duration": duration, "aspect": aspect, "eta": eta,
-                                                       "resolution": resolution})
+                                                       "resolution": resolution, "mode": getattr(e, "H3_MODE", "fl2va"),
+                                                       "references": len(refs)})
 
     def video_upscale(self):
         """Regenerate a preview that is still in memory at a higher resolution."""
