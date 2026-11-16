@@ -10,7 +10,14 @@ variable, and the two cannot run at the same time (the single H3 transformer tak
 
 Nothing changes unless `H3_MODE=ref2va` is set.
 
-## Notebook cells
+## The notebook
+
+`MiniMax_H3_Ref2VA_Kaggle.ipynb` does all of this in one go (it is the FL2VA notebook with the minimal changes: Step 1 downloads
+the Ref2VA transformer and the Ref2V Turbo LoRA instead of the FL2VA ones and writes `H3_MODE=ref2va` into
+`h3_2k_settings.json`). Its cells: Step 1 weights, Step 2 this repository, Step 3 a quick test without the server
+(`test_ref2va.py`), Step 4 the server. The sections below describe the same thing by hand.
+
+## Notebook cells (by hand)
 
 Run the normal Step 1 first (it leaves the shared weights in `/kaggle/tmp`). Then, instead of the usual server cell:
 
@@ -64,6 +71,13 @@ A first / last frame can be combined with references. `options` now also reports
 
 ## Testing it, in this order
 
+`test_ref2va.py` makes one clip straight with the engine (no server, no qComfy), prints the GPU memory peaks and ends, so
+both GPUs are free again afterwards:
+
+```
+python comfy-inference-server/test_ref2va.py --prompt "A woman dances in the rain" --ref refs/woman.png --ref-names "the dancer" --ref-size 70
+```
+
 1. **No references.** A text-only clip. This checks that the Ref2VA transformer, the tensor-parallel split and the
    Turbo LoRA work at all. Note the seconds per step.
 2. **One reference** at 384p, `ref_size` 70. Compare memory and time with step 1.
@@ -89,6 +103,8 @@ If something fails, send the traceback and the `MiniMax H3 mode:` line.
 | `H3_REF2V_LORA` | `<LoRA folder>/ref2v_turbo/minimax_h3_lightx2v_ref2v_turbo_4step_alpha8_v0.1_bf16.safetensors` | preview LoRA of Ref2VA mode |
 | `H3_MAX_REFS` | `4` | most reference images per clip |
 | `H3_REF2VA_UPSCALE` | `0` | `1` allows the 2K upscale in Ref2VA mode |
+
+`test_ref2va.py` options: `--prompt --dialogue --language --sound --music --ref (repeat) --ref-names --ref-size --start --end --duration --aspect --resolution --seed`.
 
 `build_video_engine.py` carries the changes (`REF2VA_PATCHES`) so that a newer version of the notebook can be converted
 the same way; `video_engine.py` in this folder is already the result.
