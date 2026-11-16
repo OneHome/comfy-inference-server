@@ -172,6 +172,27 @@ if REF2VA and not getattr(pipeline, "reference_mode", False):
         if not name:
             return None, "❌ Make a preview first (or pick one in 🎞️ Preview to upscale)."
 '''),
+    # 8. Wan2GP's Ref2VA path calls the VAE inside a default-device context (the traceback shows torch/utils/_device.py)
+    ('''pipeline.vae._decode = parallel_vae_decode
+''', '''pipeline.vae._decode = parallel_vae_decode
+if REF2VA:
+    # The Ref2VA path calls vae.decode() inside `with torch.device(<GPU>)`. A default device belongs to ONE thread, and the
+    # two-GPU decoder decodes clip 0 in this thread and clip 1 in a worker thread: tensors created without an explicit device
+    # (the FP16 canvas of _decode_clip_lean) landed on the GPU in one and on the CPU in the other, and the first-video check
+    # compared them ("cuda:1 and cpu"). The decoder's own devices are explicit, so decode with the plain CPU default
+    # that FL2VA mode has.
+    _parallel_vae_decode_impl = parallel_vae_decode
+    _ambient_default_device = [None]
+
+    def parallel_vae_decode(*args, **kwargs):
+        if _ambient_default_device[0] is None:
+            _ambient_default_device[0] = str(getattr(torch, "get_default_device", lambda: "?")())
+            print(f"ℹ️ Ref2VA: the pipeline calls the VAE with default device {_ambient_default_device[0]}; decoding with cpu, as in FL2VA mode")
+        with torch.device("cpu"):
+            return _parallel_vae_decode_impl(*args, **kwargs)
+
+    pipeline.vae._decode = parallel_vae_decode
+'''),
 ]
 
 
